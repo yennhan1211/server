@@ -144,6 +144,7 @@ type Server struct {
 	Log          *slog.Logger         // minimal no-alloc logger
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+	clientLocks  clientLocks          // serializes takeover, disconnect cleanup and expiry per client id
 }
 
 // loop contains interval tickers for the system events loop.
@@ -454,8 +455,12 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	s.hooks.OnSessionEstablish(cl, pk)
 
+	// Taking over the existing session and registering this one must not interleave with
+	// another connection or teardown for the same id.
+	unlock := s.clientLocks.lock(cl.ID)
 	sessionPresent := s.inheritClientSession(pk, cl)
 	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	unlock()
 
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
 	if err != nil {
@@ -483,12 +488,24 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	s.Log.Debug("client disconnected", "error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
 
 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
+
+	// Under the client id lock a new session for the same id either took this one over
+	// before OnDisconnect (IsTakenOver is true) or connects after the cleanup below, so
+	// hooks never see this disconnect after the new session was established.
+	unlock = s.clientLocks.lock(cl.ID)
+	defer unlock()
+
 	s.hooks.OnDisconnect(cl, err, expire)
 
 	if expire && !cl.IsTakenOver() {
 		cl.ClearInflights()
-		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+
+		// The session may have expired and been replaced by a new session with the same id,
+		// which keeps its subscriptions and its entry.
+		if current, ok := s.Clients.Get(cl.ID); !ok || current == cl {
+			s.UnsubscribeClient(cl)
+			s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		}
 	}
 
 	return err
@@ -1707,8 +1724,12 @@ func (s *Server) clearExpiredClients(dt int64) {
 		}
 
 		if disconnected+int64(expire) < dt {
-			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			unlock := s.clientLocks.lock(id)
+			if current, ok := s.Clients.Get(id); ok && current == client { // not reconnected since the snapshot
+				s.hooks.OnClientExpired(client)
+				s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			}
+			unlock()
 		}
 	}
 }

@@ -101,6 +101,48 @@ func (cl *Clients) GetByListener(id string) []*Client {
 	return clients
 }
 
+// clientLocks serializes, per client id, the steps which replace or remove the client
+// registered under that id: session takeover, disconnect cleanup and session expiry.
+// Without it two connections with the same id can both take over the old session and
+// both register, leaving one connected but no longer receiving messages, and a closing
+// session can delete the entry of the session which replaced it. The zero value is ready
+// to use. Unused ids are dropped, so the map only holds ids currently being locked.
+type clientLocks struct {
+	mu       sync.Mutex
+	internal map[string]*clientLock
+}
+
+type clientLock struct {
+	sync.Mutex
+	refs int // holders and waiters
+}
+
+// lock blocks until the lock for the client id is held, and returns the function which releases it.
+func (l *clientLocks) lock(id string) (unlock func()) {
+	l.mu.Lock()
+	if l.internal == nil {
+		l.internal = map[string]*clientLock{}
+	}
+	lk, ok := l.internal[id]
+	if !ok {
+		lk = new(clientLock)
+		l.internal[id] = lk
+	}
+	lk.refs++
+	l.mu.Unlock()
+
+	lk.Lock()
+	return func() {
+		lk.Unlock()
+		l.mu.Lock()
+		lk.refs--
+		if lk.refs == 0 {
+			delete(l.internal, id)
+		}
+		l.mu.Unlock()
+	}
+}
+
 // Client contains information about a client known by the broker.
 type Client struct {
 	Properties   ClientProperties // client properties
