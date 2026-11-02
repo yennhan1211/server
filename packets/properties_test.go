@@ -331,3 +331,91 @@ func TestCopyPropertiesNoTransfer(t *testing.T) {
 	// Properties which should never be transferred from one connection to another
 	require.Equal(t, uint16(0), pkB.TopicAlias)
 }
+
+// userPropertyBytes returns a property section holding count two-byte user properties.
+func userPropertyBytes(count int) []byte {
+	props := new(bytes.Buffer)
+	for i := 0; i < count; i++ {
+		props.Write([]byte{PropUser, 0, 1, 'k', 0, 1, 'v'})
+	}
+
+	b := new(bytes.Buffer)
+	encodeLength(b, int64(props.Len()))
+	b.Write(props.Bytes())
+	return b.Bytes()
+}
+
+// subscriptionIdentifierBytes returns a property section holding count subscription identifiers.
+func subscriptionIdentifierBytes(count int) []byte {
+	props := new(bytes.Buffer)
+	for i := 0; i < count; i++ {
+		props.Write([]byte{PropSubscriptionIdentifier, 1})
+	}
+
+	b := new(bytes.Buffer)
+	encodeLength(b, int64(props.Len()))
+	b.Write(props.Bytes())
+	return b.Bytes()
+}
+
+func TestDecodePropertiesUserPropertiesAtLimit(t *testing.T) {
+	props := new(Properties)
+	_, err := props.Decode(Connect, bytes.NewBuffer(userPropertyBytes(maxUserProperties)))
+	require.NoError(t, err)
+	require.Len(t, props.User, maxUserProperties)
+	require.Equal(t, UserProperty{Key: "k", Val: "v"}, props.User[maxUserProperties-1])
+}
+
+func TestDecodePropertiesUserPropertiesOverLimit(t *testing.T) {
+	props := new(Properties)
+	_, err := props.Decode(Connect, bytes.NewBuffer(userPropertyBytes(maxUserProperties+1)))
+	require.Error(t, err)
+	require.Len(t, props.User, maxUserProperties)
+}
+
+// A 256 KiB property section of two-byte user properties used to decode into ~50k
+// entries (1.6 MB); decoding must now stop at the limit.
+func TestDecodePropertiesUserPropertiesFlood(t *testing.T) {
+	props := new(Properties)
+	_, err := props.Decode(Publish, bytes.NewBuffer(userPropertyBytes(256*1024/7)))
+	require.Error(t, err)
+	require.LessOrEqual(t, cap(props.User), 2*maxUserProperties)
+}
+
+func TestDecodePropertiesUserPropertyBadValue(t *testing.T) {
+	// one user property with a valid key and a value length running past the buffer.
+	b := bytes.NewBuffer([]byte{7, PropUser, 0, 1, 'k', 0, 9, 'v'})
+	props := new(Properties)
+	_, err := props.Decode(Connect, b)
+	require.Error(t, err)
+	require.Empty(t, props.User)
+}
+
+func TestDecodePropertiesSubscriptionIdentifiersAtLimit(t *testing.T) {
+	props := new(Properties)
+	_, err := props.Decode(Publish, bytes.NewBuffer(subscriptionIdentifierBytes(maxSubscriptionIdentifiers)))
+	require.NoError(t, err)
+	require.Len(t, props.SubscriptionIdentifier, maxSubscriptionIdentifiers)
+}
+
+func TestDecodePropertiesSubscriptionIdentifiersOverLimit(t *testing.T) {
+	props := new(Properties)
+	_, err := props.Decode(Publish, bytes.NewBuffer(subscriptionIdentifierBytes(maxSubscriptionIdentifiers+1)))
+	require.Error(t, err)
+	require.Len(t, props.SubscriptionIdentifier, maxSubscriptionIdentifiers)
+}
+
+func TestConnectDecodeTooManyUserProperties(t *testing.T) {
+	buf := []byte{
+		0, 4, 'M', 'Q', 'T', 'T', // Protocol Name
+		5,      // Protocol Version
+		1 << 1, // Packet Flags (clean start)
+		0, 30,  // Keepalive
+	}
+	buf = append(buf, userPropertyBytes(maxUserProperties+1)...)
+	buf = append(buf, 0, 3, 'z', 'e', 'n') // Client ID
+
+	pk := Packet{FixedHeader: FixedHeader{Type: Connect}}
+	err := pk.ConnectDecode(buf)
+	require.ErrorIs(t, err, ErrMalformedProperties)
+}

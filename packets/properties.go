@@ -42,6 +42,15 @@ const (
 	PropSharedSubAvailable     byte = 42
 )
 
+// Limits on the number of repeatable properties decoded from a single packet. Each
+// user property costs 5 bytes on the wire but 32 bytes once decoded (and again for
+// every Copy), so without a limit a packet within the maximum packet size, such as an
+// unauthenticated CONNECT, can expand into many megabytes of slices.
+const (
+	maxUserProperties          = 128
+	maxSubscriptionIdentifiers = 1024
+)
+
 // validPacketProperties indicates which properties are valid for which packet types.
 var validPacketProperties = map[byte]map[byte]byte{
 	PropPayloadFormat:          {Publish: 1, WillProperties: 1},
@@ -407,6 +416,10 @@ func (p *Properties) Decode(pkt byte, b *bytes.Buffer) (n int, err error) {
 				p.SubscriptionIdentifier = []int{}
 			}
 
+			if len(p.SubscriptionIdentifier) >= maxSubscriptionIdentifiers {
+				return n + bu, fmt.Errorf("more than %d subscription identifiers", maxSubscriptionIdentifiers)
+			}
+
 			n, bu, err := DecodeLength(bytes.NewBuffer(bt[offset:]))
 			if err != nil {
 				return n + bu, err
@@ -452,12 +465,19 @@ func (p *Properties) Decode(pkt byte, b *bytes.Buffer) (n int, err error) {
 			p.RetainAvailable, offset, err = decodeByte(bt, offset)
 			p.RetainAvailableFlag = true
 		case PropUser:
+			if len(p.User) >= maxUserProperties {
+				return n + bu, fmt.Errorf("more than %d user properties", maxUserProperties)
+			}
+
 			var k, v string
 			k, offset, err = decodeString(bt, offset)
 			if err != nil {
 				return n + bu, err
 			}
 			v, offset, err = decodeString(bt, offset)
+			if err != nil {
+				return n + bu, err
+			}
 			p.User = append(p.User, UserProperty{Key: k, Val: v})
 		case PropMaximumPacketSize:
 			p.MaximumPacketSize, offset, err = decodeUint32(bt, offset)
