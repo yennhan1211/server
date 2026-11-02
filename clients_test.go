@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -935,3 +936,42 @@ var (
 		packets.TPacketData[packets.Auth].Get(packets.TAuth),
 	}
 )
+
+// GetByListener used to take the read lock twice; with a writer waiting in between,
+// that deadlocks.
+func TestClientsGetByListenerWithConcurrentWriters(t *testing.T) {
+	cls := NewClients()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				cls.Add(&Client{ID: "w"})
+				cls.Delete("w")
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200000; i++ {
+			cls.GetByListener("tcp")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "GetByListener deadlocked")
+	}
+	close(stop)
+	wg.Wait()
+}
